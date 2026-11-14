@@ -68,7 +68,16 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Stride-scheduling priority (>= 2).
+    pub priority: isize,
+
+    /// Stride-scheduling accumulated stride.
+    pub stride: u64,
 }
+
+/// Default priority assigned to a new process.
+pub const INIT_PRIORITY: isize = 16;
 
 impl TaskControlBlockInner {
     /// get the trap context
@@ -118,6 +127,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: INIT_PRIORITY,
+                    stride: 0,
                 })
             },
         };
@@ -191,6 +202,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: INIT_PRIORITY,
+                    stride: 0,
                 })
             },
         });
@@ -204,6 +217,52 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+
+    /// Spawn a new child process from the given ELF image.
+    ///
+    /// Unlike `fork`, the child does NOT inherit the parent's address space; it
+    /// starts with a fresh one built from `elf_data`. The caller is responsible
+    /// for pushing the returned task onto the parent's children list and into
+    /// the scheduler.
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    priority: INIT_PRIORITY,
+                    stride: 0,
+                })
+            },
+        });
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        task_control_block
     }
 
     /// get pid of process

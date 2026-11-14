@@ -4,12 +4,21 @@ use crate::sync::UPSafeCell;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use lazy_static::*;
+
+/// A fixed constant used to derive each process's per-run stride step:
+/// `pass = BIG_STRIDE / priority`. A larger BIG_STRIDE reduces truncation
+/// error in that division at the cost of faster stride growth. Picked small
+/// enough that u64 stride accumulation does not overflow in any reasonable
+/// test run.
+pub const BIG_STRIDE: u64 = 0x10_0000;
+
 ///A array of `TaskControlBlock` that is thread-safe
 pub struct TaskManager {
     ready_queue: VecDeque<Arc<TaskControlBlock>>,
 }
 
-/// A simple FIFO scheduler.
+/// Stride scheduler: picks the Ready task with the smallest stride, then
+/// advances that task's stride by `BIG_STRIDE / priority`.
 impl TaskManager {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
@@ -21,9 +30,27 @@ impl TaskManager {
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
     }
-    /// Take a process out of the ready queue
+    /// Take the min-stride process out of the ready queue and advance its
+    /// stride by its pass.
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        if self.ready_queue.is_empty() {
+            return None;
+        }
+        let mut idx = 0usize;
+        let mut min_stride = u64::MAX;
+        for (i, task) in self.ready_queue.iter().enumerate() {
+            let s = task.inner_exclusive_access().stride;
+            if s < min_stride {
+                min_stride = s;
+                idx = i;
+            }
+        }
+        let task = self.ready_queue.remove(idx).unwrap();
+        let mut inner = task.inner_exclusive_access();
+        let pass = BIG_STRIDE / inner.priority as u64;
+        inner.stride = inner.stride.wrapping_add(pass);
+        drop(inner);
+        Some(task)
     }
 }
 
