@@ -53,6 +53,25 @@ impl OSInode {
         }
         v
     }
+    /// Return `(ino, is_dir, nlink)` for this inode by looking up the root
+    /// directory for link count.
+    pub fn stat_info(&self) -> (u64, bool, u32) {
+        let inode = self.inner.exclusive_access().inode.clone();
+        let ino = inode.inode_id() as u64;
+        let is_dir = inode.is_dir();
+        let nlink = ROOT_INODE.nlink_of(ino as u32);
+        (ino, is_dir, nlink)
+    }
+}
+
+/// Create a hard link `new_name` pointing at `old_name` under the root.
+pub fn link_at(old_name: &str, new_name: &str) -> isize {
+    ROOT_INODE.link(old_name, new_name)
+}
+
+/// Remove `name` from the root directory; reclaims the inode on last link.
+pub fn unlink_at(name: &str) -> isize {
+    ROOT_INODE.unlink(name)
 }
 
 lazy_static! {
@@ -155,5 +174,8 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn stat(&self) -> Option<(u64, bool, u32)> {
+        Some(self.stat_info())
     }
 }

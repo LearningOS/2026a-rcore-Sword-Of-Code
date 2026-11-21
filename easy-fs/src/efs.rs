@@ -148,4 +148,18 @@ impl EasyFileSystem {
             (block_id - self.data_area_start_block) as usize,
         )
     }
+    /// Deallocate an inode slot in the inode bitmap. The caller is
+    /// responsible for releasing any data blocks the inode was referencing.
+    pub fn dealloc_inode(&mut self, inode_id: u32) {
+        self.inode_bitmap
+            .dealloc(&self.block_device, inode_id as usize);
+    }
+    /// Reverse of `get_disk_inode_pos`: compute the inode id for a given
+    /// `(block_id, block_offset)` within the inode area.
+    pub fn get_inode_id_from_pos(&self, block_id: u32, block_offset: usize) -> u32 {
+        let inode_size = core::mem::size_of::<DiskInode>();
+        let inodes_per_block = (BLOCK_SZ / inode_size) as u32;
+        (block_id - self.inode_area_start_block) * inodes_per_block
+            + (block_offset / inode_size) as u32
+    }
 }

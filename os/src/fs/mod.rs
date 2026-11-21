@@ -15,6 +15,11 @@ pub trait File: Send + Sync {
     fn read(&self, buf: UserBuffer) -> usize;
     /// write to the file from buf, return the number of bytes written
     fn write(&self, buf: UserBuffer) -> usize;
+    /// `fstat` support. Returns `(ino, is_dir, nlink)` for inode-backed
+    /// files; non-inode files (stdio, pipes, ...) return `None`.
+    fn stat(&self) -> Option<(u64, bool, u32)> {
+        None
+    }
 }
 
 /// The stat of a inode
@@ -46,5 +51,5 @@ bitflags! {
     }
 }
 
-pub use inode::{list_apps, open_file, OSInode, OpenFlags};
+pub use inode::{link_at, list_apps, open_file, unlink_at, OSInode, OpenFlags};
 pub use stdio::{Stdin, Stdout};
