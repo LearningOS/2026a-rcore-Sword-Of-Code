@@ -4,6 +4,7 @@ use super::UPSafeCell;
 use crate::task::TaskControlBlock;
 use crate::task::{block_current_and_run_next, suspend_current_and_run_next};
 use crate::task::{current_task, wakeup_task};
+use alloc::vec::Vec;
 use alloc::{collections::VecDeque, sync::Arc};
 
 /// Mutex trait
@@ -12,6 +13,10 @@ pub trait Mutex: Sync + Send {
     fn lock(&self);
     /// Unlock the mutex
     fn unlock(&self);
+    /// Tids of threads currently blocked waiting for this mutex (for deadlock detection).
+    fn waiter_tids(&self) -> Vec<usize> {
+        Vec::new()
+    }
 }
 
 /// Spinlock Mutex struct
@@ -101,5 +106,14 @@ impl Mutex for MutexBlocking {
         } else {
             mutex_inner.locked = false;
         }
+    }
+
+    fn waiter_tids(&self) -> Vec<usize> {
+        let inner = self.inner.exclusive_access();
+        inner
+            .wait_queue
+            .iter()
+            .filter_map(|task| task.inner_exclusive_access().res.as_ref().map(|r| r.tid))
+            .collect()
     }
 }

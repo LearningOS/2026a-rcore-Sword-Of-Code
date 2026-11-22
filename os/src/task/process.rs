@@ -49,6 +49,12 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// whether deadlock detection is enabled for this process
+    pub deadlock_detect_enabled: bool,
+    /// mutex allocation matrix: mutex_alloc[tid][mutex_id]
+    pub mutex_alloc: Vec<Vec<u32>>,
+    /// semaphore allocation matrix: sem_alloc[tid][sem_id]
+    pub sem_alloc: Vec<Vec<u32>>,
 }
 
 impl ProcessControlBlockInner {
@@ -82,6 +88,165 @@ impl ProcessControlBlockInner {
     pub fn get_task(&self, tid: usize) -> Arc<TaskControlBlock> {
         self.tasks[tid].as_ref().unwrap().clone()
     }
+
+    /// Ensure the mutex allocation matrix has a row for `tid` and width covering `mutex_list`.
+    pub fn ensure_mutex_entry(&mut self, tid: usize) {
+        while self.mutex_alloc.len() <= tid {
+            self.mutex_alloc.push(Vec::new());
+        }
+        let m = self.mutex_list.len();
+        for row in self.mutex_alloc.iter_mut() {
+            while row.len() < m {
+                row.push(0);
+            }
+        }
+    }
+
+    /// Ensure the semaphore allocation matrix has a row for `tid` and width covering `semaphore_list`.
+    pub fn ensure_sem_entry(&mut self, tid: usize) {
+        while self.sem_alloc.len() <= tid {
+            self.sem_alloc.push(Vec::new());
+        }
+        let m = self.semaphore_list.len();
+        for row in self.sem_alloc.iter_mut() {
+            while row.len() < m {
+                row.push(0);
+            }
+        }
+    }
+
+    /// Reset per-thread deadlock accounting for a (possibly recycled) tid.
+    pub fn reset_deadlock_tid(&mut self, tid: usize) {
+        if let Some(row) = self.mutex_alloc.get_mut(tid) {
+            for v in row.iter_mut() {
+                *v = 0;
+            }
+        }
+        if let Some(row) = self.sem_alloc.get_mut(tid) {
+            for v in row.iter_mut() {
+                *v = 0;
+            }
+        }
+    }
+
+    /// Banker's-algorithm safety check for a hypothetical mutex_lock(mutex_id) by `tid`.
+    /// Need for other threads is derived from the mutex wait queues.
+    pub fn is_mutex_safe(&self, tid: usize, mutex_id: usize) -> bool {
+        let m = self.mutex_list.len();
+        let n = self.tasks.len().max(tid + 1);
+        if m == 0 || mutex_id >= m {
+            return true;
+        }
+        let mut available = vec![1i64; m];
+        for j in 0..m {
+            if self.mutex_list[j].is_none() {
+                available[j] = 0;
+            }
+        }
+        let mut alloc = vec![vec![0i64; m]; n];
+        for t in 0..n {
+            if let Some(row) = self.mutex_alloc.get(t) {
+                for (j, &v) in row.iter().enumerate().take(m) {
+                    alloc[t][j] = v as i64;
+                    available[j] -= v as i64;
+                }
+            }
+        }
+        let mut need = vec![vec![0i64; m]; n];
+        for (j, slot) in self.mutex_list.iter().enumerate() {
+            if let Some(mtx) = slot {
+                for wtid in mtx.waiter_tids() {
+                    if wtid < n {
+                        need[wtid][j] = 1;
+                    }
+                }
+            }
+        }
+        need[tid][mutex_id] += 1;
+
+        run_bankers(&available, &alloc, &need, &self.tasks)
+    }
+
+    /// Banker's-algorithm safety check for a hypothetical semaphore_down(sem_id) by `tid`.
+    pub fn is_sem_safe(&self, tid: usize, sem_id: usize) -> bool {
+        let m = self.semaphore_list.len();
+        let n = self.tasks.len().max(tid + 1);
+        if m == 0 || sem_id >= m {
+            return true;
+        }
+        let mut available = vec![0i64; m];
+        let mut need = vec![vec![0i64; m]; n];
+        for (j, slot) in self.semaphore_list.iter().enumerate() {
+            if let Some(sem) = slot {
+                let inner = sem.inner.exclusive_access();
+                available[j] = inner.count.max(0) as i64;
+                for task in inner.wait_queue.iter() {
+                    let task_inner = task.inner_exclusive_access();
+                    if let Some(res) = task_inner.res.as_ref() {
+                        if res.tid < n {
+                            need[res.tid][j] = 1;
+                        }
+                    }
+                }
+            }
+        }
+        need[tid][sem_id] += 1;
+
+        let mut alloc = vec![vec![0i64; m]; n];
+        for t in 0..n {
+            if let Some(row) = self.sem_alloc.get(t) {
+                for (j, &v) in row.iter().enumerate().take(m) {
+                    alloc[t][j] = v as i64;
+                }
+            }
+        }
+
+        run_bankers(&available, &alloc, &need, &self.tasks)
+    }
+}
+
+/// Run the banker's safety check. Threads whose `tasks` slot is `None` are treated as
+/// already finished.
+fn run_bankers(
+    available: &[i64],
+    alloc: &[Vec<i64>],
+    need: &[Vec<i64>],
+    tasks: &[Option<Arc<TaskControlBlock>>],
+) -> bool {
+    let n = alloc.len();
+    let m = available.len();
+    let mut work: Vec<i64> = available.to_vec();
+    let mut finish = vec![false; n];
+    // treat vacant / dead threads as finished (release their allocation into work)
+    for t in 0..n {
+        let dead = tasks.get(t).map_or(true, |opt| opt.is_none());
+        if dead {
+            finish[t] = true;
+            for j in 0..m {
+                work[j] += alloc[t][j];
+            }
+        }
+    }
+    loop {
+        let mut progress = false;
+        for t in 0..n {
+            if finish[t] {
+                continue;
+            }
+            let ok = (0..m).all(|j| need[t][j] <= work[j]);
+            if ok {
+                finish[t] = true;
+                for j in 0..m {
+                    work[j] += alloc[t][j];
+                }
+                progress = true;
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+    finish.iter().all(|&f| f)
 }
 
 impl ProcessControlBlock {
@@ -119,6 +284,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect_enabled: false,
+                    mutex_alloc: Vec::new(),
+                    sem_alloc: Vec::new(),
                 })
             },
         });
@@ -245,6 +413,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect_enabled: false,
+                    mutex_alloc: Vec::new(),
+                    sem_alloc: Vec::new(),
                 })
             },
         });
